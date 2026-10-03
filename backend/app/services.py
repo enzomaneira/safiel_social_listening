@@ -10,7 +10,12 @@ from .normalizer import normalize
 def upsert_posts(tweets, includes=None, rule_id=None, capture_id=None, endpoint="unknown", price=0.005):
     includes = includes or {}
     users = {user["id"]: user for user in includes.get("users", [])}
-    for user in users.values():
+    authors_to_store = dict(users)
+    for tweet in tweets:
+        author_id = tweet.get("author_id")
+        if author_id and author_id not in authors_to_store:
+            authors_to_store[author_id] = {"id": author_id}
+    for user in authors_to_store.values():
         metrics = user.get("public_metrics") or {}
         existing = db.session.get(XAuthor, user["id"])
         values = {"author_id": user["id"], "username": user.get("username"), "name": user.get("name"),
@@ -18,7 +23,7 @@ def upsert_posts(tweets, includes=None, rule_id=None, capture_id=None, endpoint=
                   "last_updated_at": datetime.now(timezone.utc)}
         if existing:
             for key, value in values.items():
-                if key != "author_id":
+                if key != "author_id" and value is not None:
                     setattr(existing, key, value)
         else:
             db.session.add(XAuthor(**values))

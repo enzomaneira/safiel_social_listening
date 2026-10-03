@@ -54,3 +54,9 @@ class XClient:
 
     def get_post(self, post_id):
         return self.get(f"/tweets/{post_id}", self.FIELDS)
+
+    def get_quotes(self, post_id, pagination_token=None):
+        params = {**self.FIELDS, "max_results": 100}
+        if pagination_token:
+            params["pagination_token"] = pagination_token
+        return self.get(f"/tweets/{post_id}/quote_tweets", params)

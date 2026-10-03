@@ -1,5 +1,4 @@
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -72,17 +71,48 @@ def process_captures():
         db.session.commit()
         capture_id, post_id = capture.id, capture.root_post_id
         try:
-            result = XClient(token).get_post(post_id)
-            tweets = result.get("data")
-            if not tweets:
+            client = XClient(token)
+            original_result = client.get_post(post_id)
+            original = original_result.get("data")
+            if not original:
                 raise XAPIError("Post não encontrado ou indisponível")
-            upsert_posts([tweets], result.get("includes"), capture_id=capture_id,
-                         endpoint="tweet_lookup", price=app.config["POST_PRICE_USD"])
-            current = db.session.get(Capture, capture_id)
-            current.status = "partial"
-            current.error = "MVP: post raiz capturado. Coleta de replies e quotes será processada em uma próxima versão."
-            current.finished_at = datetime.now(timezone.utc)
-            db.session.commit()
+            root_id = original.get("conversation_id") or post_id
+            collected = [original]
+            includes = {"users": list(original_result.get("includes", {}).get("users", []))}
+            replies = 0
+            quotes = 0
+            search_token = None
+            while True:
+                search = client.search_recent(f"conversation_id:{root_id}", next_token=search_token)
+                batch = search.get("data") or []
+                collected.extend(batch)
+                includes["users"].extend(search.get("includes", {}).get("users", []))
+                replies += sum(1 for item in batch if item.get("id") != post_id)
+                search_token = (search.get("meta") or {}).get("next_token")
+                if not search_token or len(collected) >= 500:
+                    break
+            quote_token = None
+            while True:
+                quoted = client.get_quotes(post_id, pagination_token=quote_token)
+                batch = quoted.get("data") or []
+                collected.extend(batch)
+                includes["users"].extend(quoted.get("includes", {}).get("users", []))
+                quotes += len(batch)
+                quote_token = (quoted.get("meta") or {}).get("next_token")
+                if not quote_token or len(collected) >= 1000:
+                    break
+            unique_posts = {str(item["id"]): item for item in collected if item.get("id")}
+            upsert_posts(list(unique_posts.values()), includes, capture_id=capture_id,
+                         endpoint="capture", price=app.config["POST_PRICE_USD"])
+            with app.app_context():
+                current = db.session.get(Capture, capture_id)
+                if current:
+                    current.status = "partial" if search_token or quote_token else "done"
+                    current.replies_found = replies
+                    current.quotes_found = quotes
+                    current.error = "Limite de posts atingido; resultados podem estar incompletos." if search_token or quote_token else None
+                    current.finished_at = datetime.now(timezone.utc)
+                    db.session.commit()
         except Exception as exc:
             db.session.rollback()
             current = db.session.get(Capture, capture_id)
@@ -92,7 +122,6 @@ def process_captures():
                 current.finished_at = datetime.now(timezone.utc)
                 db.session.add(SystemLog(level="ERROR", source=f"capture:{capture_id}", message=str(exc)[:1000]))
                 db.session.commit()
-
 
 def acquire_lock():
     if db.engine.dialect.name == "postgresql":

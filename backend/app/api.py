@@ -106,6 +106,7 @@ def delete_rule(rule_id):
     rule = db.session.get(MonitoringRule, rule_id)
     if not rule:
         return jsonify({"error": "Regra não encontrada"}), 404
+    XPost.query.filter_by(source_rule_id=rule.id).update({"source_rule_id": None})
     db.session.delete(rule)
     db.session.commit()
     return "", 204
@@ -117,7 +118,10 @@ def run_rule(rule_id):
     rule = db.session.get(MonitoringRule, rule_id)
     if not rule:
         return jsonify({"error": "Regra não encontrada"}), 404
-    return jsonify({"message": "Execução enfileirada para o worker", "rule_id": rule.id}), 202
+    from .jobs.scheduler import run_rule as execute_rule
+    execute_rule(rule.id)
+    db.session.refresh(rule)
+    return jsonify({"message": "Execução concluída", "rule": serialize_rule(rule)}), 200
 
 
 @api.post("/captures")
