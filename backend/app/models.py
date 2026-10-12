@@ -78,6 +78,8 @@ class XPost(db.Model):
     last_updated_at = db.Column(db.DateTime(timezone=True), default=utcnow)
     raw_payload = db.Column(db.JSON)
     author = db.relationship("XAuthor", lazy="joined")
+    classification = db.relationship("AIClassification", uselist=False, lazy="joined", cascade="all, delete-orphan")
+    signals = db.relationship("AISignal", uselist=False, lazy="joined", cascade="all, delete-orphan")
 
 
 class XMetricSnapshot(db.Model):
@@ -123,3 +125,26 @@ class AIClassification(db.Model):
     relevance_score = db.Column(db.Integer)
     classified_at = db.Column(db.DateTime(timezone=True))
     model = db.Column(db.String)
+
+
+class AISignal(db.Model):
+    """Sinais complementares da classificação por IA usados nos relatórios."""
+    __tablename__ = "ai_post_signals"
+    post_id = db.Column(db.String, db.ForeignKey("x_posts.post_id"), primary_key=True)
+    pertinence = db.Column(db.String)  # direta | contextual | fora_do_tema
+    emotion = db.Column(db.String)
+    risk = db.Column(db.String)  # nenhum | agressao | ameaca | acusacao_sem_prova | boato
+
+
+class Report(db.Model):
+    __tablename__ = "reports"
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String, nullable=False)
+    status = db.Column(db.String, default="queued")
+    params = db.Column(db.JSON)
+    summary = db.Column(db.JSON)
+    docx = db.Column(db.LargeBinary)
+    error = db.Column(db.Text)
+    cost_usd = db.Column(db.Numeric(10, 4))
+    created_at = db.Column(db.DateTime(timezone=True), default=utcnow)
+    finished_at = db.Column(db.DateTime(timezone=True))

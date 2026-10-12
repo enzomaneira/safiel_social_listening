@@ -6,9 +6,9 @@ from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.blocking import BlockingScheduler
 from sqlalchemy import text
 
-from app import create_app
+from app import ai_classifier, create_app, reports
 from app.extensions import db
-from app.models import Capture, MonitoringRule, SystemLog, XPost
+from app.models import AIClassification, AISignal, Capture, MonitoringRule, Report, SystemLog, XPost
 from app.services import month_spend, record_usage, take_snapshot, upsert_posts
 from app.x_client import XAPIError, XClient
 
@@ -221,6 +221,125 @@ def snapshot_relevant_posts():
             db.session.commit()
 
 
+def ai_available():
+    budget = app.config["MONTHLY_BUDGET_USD"]
+    return (app.config["AI_CLASSIFICATION_ENABLED"] and ai_classifier.is_configured()
+            and not (budget and month_spend() >= budget))
+
+
+def classify_and_save(posts):
+    """Classifica posts com IA e grava classificação + sinais. Retorna (classificados, recusados, custo, avisos)."""
+    parent_ids = {post.in_reply_to_post_id or post.quoted_post_id for post in posts} - {None}
+    parents = {post.post_id: post.text for post in db.session.query(XPost).filter(XPost.post_id.in_(parent_ids)).all()} if parent_ids else {}
+    outcomes, cost, warnings = ai_classifier.classify_posts(posts, app.config, parents)
+    classified_at = datetime.now(timezone.utc)
+    refused = 0
+    for post_id, fields in outcomes:
+        if fields is None:
+            refused += 1
+            db.session.merge(AIClassification(post_id=post_id, model=ai_classifier.REFUSED_MODEL_LABEL, classified_at=classified_at))
+            continue
+        fields = dict(fields)
+        signals = {key: fields.pop(key) for key in ai_classifier.SIGNAL_FIELDS}
+        db.session.merge(AIClassification(post_id=post_id, model=app.config["AI_MODEL"], classified_at=classified_at, **fields))
+        db.session.merge(AISignal(post_id=post_id, **signals))
+    record_usage("ai_classification", len(outcomes), cost)
+    db.session.commit()
+    return len(outcomes) - refused, refused, cost, warnings
+
+
+def unclassified_query():
+    return (db.session.query(XPost).outerjoin(AIClassification, AIClassification.post_id == XPost.post_id)
+            .filter(AIClassification.post_id.is_(None), XPost.post_type != "repost", XPost.text.isnot(None)))
+
+
+def classify_pending_posts():
+    """Classifica com IA os posts ainda sem análise (sentimento, posicionamento, narrativa...)."""
+    with app.app_context():
+        if not app.config["AI_CLASSIFICATION_ENABLED"] or not ai_classifier.is_configured():
+            return
+        if not ai_available():
+            logging.warning("Classificação por IA adiada: orçamento mensal atingido")
+            return
+        posts = unclassified_query().order_by(XPost.created_at.desc()).limit(app.config["AI_MAX_POSTS_PER_RUN"]).all()
+        if not posts:
+            return
+        try:
+            classified, refused, cost, warnings = classify_and_save(posts)
+        except Exception as exc:
+            db.session.rollback()
+            logging.error("Classificação por IA falhou: %s", exc)
+            db.session.add(SystemLog(level="ERROR", source="ai", message=str(exc)[:1000]))
+            db.session.commit()
+            return
+        message = f"Classificação por IA: {classified} posts classificados, {refused} recusados (US$ {cost:.4f})"
+        if warnings:
+            message += f"; {len(warnings)} sem resposta válida (serão tentados de novo)"
+        logging.info(message)
+        db.session.add(SystemLog(level="INFO", source="ai", message=message))
+        db.session.commit()
+
+
+def report_posts_query(params):
+    start = datetime.fromisoformat(params["date_from"]).replace(tzinfo=reports.BRT)
+    end = datetime.fromisoformat(params["date_to"]).replace(tzinfo=reports.BRT) + timedelta(days=1)
+    query = db.session.query(XPost).filter(XPost.created_at >= start, XPost.created_at < end)
+    if params.get("rule_id"):
+        query = query.filter(XPost.source_rule_id == params["rule_id"])
+    return query
+
+
+def process_reports():
+    """Gera os relatórios na fila: classifica o que faltar, calcula indicadores, escreve a análise e monta o .docx."""
+    with app.app_context():
+        report = Report.query.filter_by(status="queued").order_by(Report.created_at).with_for_update(skip_locked=True).first()
+        if not report:
+            return
+        report.status = "running"
+        db.session.commit()
+        report_id, params, title = report.id, dict(report.params or {}), report.title
+        try:
+            cost, notice = 0.0, None
+            use_ai = ai_available()
+            if use_ai:
+                pending = (unclassified_query().filter(XPost.post_id.in_(report_posts_query(params).with_entities(XPost.post_id)))
+                           .limit(app.config["REPORT_CLASSIFY_LIMIT"]).all())
+                if pending:
+                    cost += classify_and_save(pending)[2]
+                    db.session.expire_all()
+            posts = report_posts_query(params).all()
+            if not posts:
+                raise RuntimeError("Nenhum post encontrado no período e na regra selecionados")
+            metrics = reports.compute_metrics(posts)
+            corpus = reports.corpus_for_ai(posts, app.config["REPORT_MAX_POSTS"])
+            analysis = None
+            if not use_ai:
+                notice = ("Análise qualitativa não gerada: a IA está desativada, sem chave configurada ou o orçamento mensal "
+                          "foi atingido. O relatório contém só os indicadores.")
+            elif not corpus:
+                notice = "Nenhum post do recorte foi classificado como pertinente ao tema; não há base para a análise qualitativa."
+            else:
+                analysis, analysis_cost, notice = reports.write_analysis(metrics, corpus, params, app.config)
+                cost += analysis_cost
+                record_usage("ai_report", len(corpus), analysis_cost)
+            document = reports.build_docx(title, params, metrics, analysis, corpus, notice)
+            current = db.session.get(Report, report_id)
+            current.status, current.docx, current.cost_usd = "done", document, round(cost, 4)
+            current.summary = {"metrics": metrics, "notice": notice,
+                               "executive_summary": analysis["executive_summary"] if analysis else None,
+                               "central_reading": analysis["central_reading"] if analysis else None}
+            current.finished_at = datetime.now(timezone.utc)
+            logging.info("Relatório %s gerado: %s posts, núcleo %s, US$ %.4f", report_id, metrics["total"], metrics["core"], cost)
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            current = db.session.get(Report, report_id)
+            current.status, current.error, current.finished_at = "error", str(exc)[:1000], datetime.now(timezone.utc)
+            logging.error("Relatório %s falhou: %s", report_id, exc)
+            db.session.add(SystemLog(level="ERROR", source=f"report:{report_id}", message=str(exc)[:1000]))
+            db.session.commit()
+
+
 def acquire_lock(timeout=None, interval=5):
     # Durante um redeploy o Railway mantém o container antigo rodando por alguns minutos;
     # em vez de encerrar na hora, espera o lock ser liberado.
@@ -247,6 +366,9 @@ def main():
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(dispatch_rules, "interval", minutes=1, id="dispatch_rules", max_instances=1, coalesce=True)
     scheduler.add_job(process_captures, "interval", seconds=15, id="process_captures", max_instances=1, coalesce=True)
+    scheduler.add_job(process_reports, "interval", seconds=20, id="process_reports", max_instances=1, coalesce=True)
+    scheduler.add_job(classify_pending_posts, "interval", minutes=max(1, app.config["AI_INTERVAL_MINUTES"]),
+                      id="classify_pending_posts", max_instances=1, coalesce=True)
     scheduler.add_job(snapshot_relevant_posts, "interval", minutes=max(15, app.config["SNAPSHOT_INTERVAL_MINUTES"]),
                       id="snapshot_relevant_posts", max_instances=1, coalesce=True)
     scheduler.start()

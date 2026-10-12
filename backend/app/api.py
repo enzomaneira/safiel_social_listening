@@ -2,6 +2,7 @@ import csv
 import io
 import re
 import time
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 
@@ -11,7 +12,8 @@ from flask import Blueprint, current_app, jsonify, request, send_file
 from sqlalchemy import func, or_
 
 from .extensions import db
-from .models import AIClassification, ApiUsage, Capture, MonitoringRule, SystemLog, XAuthor, XMetricSnapshot, XPost
+from .models import AIClassification, AISignal, ApiUsage, Capture, MonitoringRule, Report, SystemLog, XAuthor, XMetricSnapshot, XPost
+from . import ai_classifier
 from .services import month_spend, take_snapshot
 from .x_client import XAPIError, XClient
 
@@ -41,6 +43,18 @@ def serialize_rule(rule):
             "last_error": rule.last_error}
 
 
+def serialize_classification(item, signals=None):
+    if not item:
+        return None
+    if item.model == ai_classifier.REFUSED_MODEL_LABEL:
+        return {"status": "refused", "classified_at": item.classified_at.isoformat() if item.classified_at else None}
+    return {"status": "done", "sentiment": item.sentiment, "stance": item.stance, "topic": item.topic, "target": item.target,
+            "narrative": item.narrative, "irony": item.irony, "relevance_score": item.relevance_score, "model": item.model,
+            "pertinence": signals.pertinence if signals else None, "emotion": signals.emotion if signals else None,
+            "risk": signals.risk if signals else None,
+            "classified_at": item.classified_at.isoformat() if item.classified_at else None}
+
+
 def serialize_post(post):
     author = post.author
     return {"post_id": post.post_id, "text": post.text, "author_id": post.author_id,
@@ -51,7 +65,7 @@ def serialize_post(post):
             "repost_count": post.repost_count, "quote_count": post.quote_count,
             "impression_count": post.impression_count, "bookmark_count": post.bookmark_count,
             "conversation_id": post.conversation_id, "in_reply_to_post_id": post.in_reply_to_post_id,
-            "quoted_post_id": post.quoted_post_id}
+            "quoted_post_id": post.quoted_post_id, "classification": serialize_classification(post.classification, post.signals)}
 
 
 @api.post("/auth/login")
@@ -241,6 +255,19 @@ def filtered_posts():
         query = query.filter(XPost.source_rule_id == request.args.get("rule_id", type=int))
     if request.args.get("type") in ("original", "reply", "quote", "repost"):
         query = query.filter(XPost.post_type == request.args["type"])
+    sentiment = request.args.get("sentiment")
+    if sentiment in ai_classifier.SENTIMENTS:
+        query = query.filter(XPost.classification.has(AIClassification.sentiment == sentiment))
+    elif sentiment == "pending":
+        query = query.filter(~XPost.classification.has())
+    stance = request.args.get("stance")
+    if stance in ai_classifier.STANCES:
+        query = query.filter(XPost.classification.has(AIClassification.stance == stance))
+    pertinence = request.args.get("pertinence")
+    if pertinence in ai_classifier.PERTINENCES:
+        query = query.filter(XPost.signals.has(AISignal.pertinence == pertinence))
+    if request.args.get("risk") == "any":
+        query = query.filter(XPost.signals.has(AISignal.risk != "nenhum"))
     relevant = request.args.get("relevant")
     if relevant in ("true", "false"):
         query = query.filter(XPost.is_relevant.is_(relevant == "true"))
@@ -306,7 +333,6 @@ def delete_post(post_id):
     if not post:
         return jsonify({"error": "Post não encontrado"}), 404
     XMetricSnapshot.query.filter_by(post_id=post_id).delete()
-    AIClassification.query.filter_by(post_id=post_id).delete()
     db.session.delete(post)
     db.session.add(SystemLog(level="INFO", source="posts", message=f"Post {post_id} removido pelo painel"))
     db.session.commit()
@@ -320,9 +346,18 @@ def stats():
     counts = {}
     for hours, label in ((6, "6h"), (12, "12h"), (24, "24h"), (168, "7d")):
         counts[label] = XPost.query.filter(XPost.created_at >= now - timedelta(hours=hours)).count()
+    latest = db.session.query(func.max(XPost.created_at)).scalar()
+    week = now - timedelta(days=7)
+    sentiment_rows = (db.session.query(AIClassification.sentiment, func.count()).join(XPost, XPost.post_id == AIClassification.post_id)
+                      .filter(XPost.created_at >= week, AIClassification.sentiment.isnot(None))
+                      .group_by(AIClassification.sentiment).all())
+    pending = (db.session.query(func.count(XPost.post_id)).outerjoin(AIClassification, AIClassification.post_id == XPost.post_id)
+               .filter(AIClassification.post_id.is_(None), XPost.post_type != "repost").scalar())
     return jsonify({"posts": counts, "rules": {"active": db.session.query(MonitoringRule).filter_by(status="active").count(),
-                    "total": db.session.query(MonitoringRule).count()}, "latest_post_at": db.session.query(func.max(XPost.created_at)).scalar().isoformat()
-                    if db.session.query(func.max(XPost.created_at)).scalar() else None})
+                    "total": db.session.query(MonitoringRule).count()}, "latest_post_at": latest.isoformat() if latest else None,
+                    "sentiment_7d": {key: 0 for key in ai_classifier.SENTIMENTS} | {key: value for key, value in sentiment_rows},
+                    "ai": {"enabled": bool(current_app.config["AI_CLASSIFICATION_ENABLED"] and ai_classifier.is_configured()),
+                           "model": current_app.config["AI_MODEL"], "pending": pending}})
 
 
 _x_usage_cache = {"at": 0.0, "value": None}
@@ -378,10 +413,17 @@ def status():
 EXPORT_FIELDS = ["post_id", "created_at", "author_id", "author_username", "author_name", "text", "post_url", "post_type",
                  "is_relevant", "language", "conversation_id", "in_reply_to_post_id", "quoted_post_id",
                  "like_count", "reply_count", "repost_count", "quote_count", "bookmark_count", "impression_count",
-                 "hashtags", "mentions", "urls", "source_rule_id", "source_capture_id", "first_collected_at"]
+                 "hashtags", "mentions", "urls", "source_rule_id", "source_capture_id", "first_collected_at",
+                 "sentiment", "stance", "topic", "target", "narrative", "irony", "relevance_score", "pertinence", "emotion", "risk"]
+AI_EXPORT_FIELDS = {"sentiment", "stance", "topic", "target", "narrative", "irony", "relevance_score"}
 
 
 def export_value(post, field):
+    if field in ai_classifier.SIGNAL_FIELDS:
+        return getattr(post.signals, field) if post.signals else None
+    if field in AI_EXPORT_FIELDS:
+        item = post.classification
+        return getattr(item, field) if item and item.model != ai_classifier.REFUSED_MODEL_LABEL else None
     if field in ("author_username", "author_name"):
         return getattr(post.author, field.removeprefix("author_"), None) if post.author else None
     value = getattr(post, field)
@@ -429,3 +471,84 @@ def export_posts():
         mime, filename = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", f"{basename}.xlsx"
     output.seek(0)
     return send_file(output, mimetype=mime, as_attachment=True, download_name=filename)
+
+
+def serialize_report(report, full=False):
+    data = {"id": report.id, "title": report.title, "status": report.status, "params": report.params, "error": report.error,
+            "cost_usd": float(report.cost_usd) if report.cost_usd is not None else None,
+            "created_at": report.created_at.isoformat() if report.created_at else None,
+            "finished_at": report.finished_at.isoformat() if report.finished_at else None,
+            "has_file": report.docx is not None}
+    if full:
+        data["summary"] = report.summary
+    return data
+
+
+@api.post("/reports")
+@require_auth
+def create_report():
+    data = request.get_json(silent=True) or {}
+    title = str(data.get("title") or "").strip()[:150] or "Análise de sentimentos e mapa de narrativas"
+    try:
+        date_from = date.fromisoformat(str(data.get("date_from")))
+        date_to = date.fromisoformat(str(data.get("date_to")))
+    except ValueError:
+        return jsonify({"error": "Informe o período (data inicial e final)"}), 400
+    if date_to < date_from:
+        return jsonify({"error": "A data final deve ser igual ou posterior à inicial"}), 400
+    if (date_to - date_from).days > 31:
+        return jsonify({"error": "O período máximo de um relatório é de 31 dias"}), 400
+    params = {"date_from": date_from.isoformat(), "date_to": date_to.isoformat(),
+              "objective": str(data.get("objective") or "").strip()[:2000]}
+    rule_id = data.get("rule_id")
+    if rule_id:
+        rule = db.session.get(MonitoringRule, int(rule_id))
+        if not rule:
+            return jsonify({"error": "Regra não encontrada"}), 404
+        params.update(rule_id=rule.id, rule_name=rule.name)
+    report = Report(title=title, params=params)
+    db.session.add(report)
+    db.session.commit()
+    return jsonify(serialize_report(report)), 202
+
+
+@api.get("/reports")
+@require_auth
+def list_reports():
+    rows = Report.query.options(db.defer(Report.docx)).order_by(Report.created_at.desc()).limit(50).all()
+    return jsonify([serialize_report(row) for row in rows])
+
+
+@api.get("/reports/<int:report_id>")
+@require_auth
+def get_report(report_id):
+    report = db.session.get(Report, report_id)
+    if not report:
+        return jsonify({"error": "Relatório não encontrado"}), 404
+    return jsonify(serialize_report(report, full=True))
+
+
+@api.get("/reports/<int:report_id>/download")
+@require_auth
+def download_report(report_id):
+    report = db.session.get(Report, report_id)
+    if not report or not report.docx:
+        return jsonify({"error": "Arquivo do relatório indisponível"}), 404
+    ascii_title = unicodedata.normalize("NFKD", report.title).encode("ascii", "ignore").decode().lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_title).strip("-")[:60] or "relatorio"
+    return send_file(io.BytesIO(report.docx), as_attachment=True, download_name=f"{slug}-{report.id}.docx",
+                     mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+
+@api.delete("/reports/<int:report_id>")
+@require_auth
+def delete_report(report_id):
+    report = db.session.get(Report, report_id)
+    if not report:
+        return jsonify({"error": "Relatório não encontrado"}), 404
+    if report.status == "running":
+        return jsonify({"error": "Aguarde o relatório terminar de ser gerado"}), 400
+    db.session.delete(report)
+    db.session.commit()
+    return "", 204
+
