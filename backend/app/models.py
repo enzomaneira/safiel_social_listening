@@ -77,6 +77,7 @@ class XPost(db.Model):
     first_collected_at = db.Column(db.DateTime(timezone=True), default=utcnow)
     last_updated_at = db.Column(db.DateTime(timezone=True), default=utcnow)
     raw_payload = db.Column(db.JSON)
+    author = db.relationship("XAuthor", lazy="joined")
 
 
 class XMetricSnapshot(db.Model):

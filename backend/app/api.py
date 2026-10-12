@@ -7,10 +7,10 @@ from functools import wraps
 import bcrypt
 import jwt
 from flask import Blueprint, current_app, jsonify, request, send_file
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from .extensions import db
-from .models import ApiUsage, Capture, MonitoringRule, SystemLog, XPost
+from .models import ApiUsage, Capture, MonitoringRule, SystemLog, XAuthor, XPost
 
 api = Blueprint("api", __name__)
 
@@ -39,7 +39,9 @@ def serialize_rule(rule):
 
 
 def serialize_post(post):
+    author = post.author
     return {"post_id": post.post_id, "text": post.text, "author_id": post.author_id,
+            "author_username": author.username if author else None, "author_name": author.name if author else None,
             "created_at": post.created_at.isoformat() if post.created_at else None,
             "post_url": post.post_url, "post_type": post.post_type, "is_relevant": post.is_relevant,
             "like_count": post.like_count, "reply_count": post.reply_count,
@@ -166,7 +168,9 @@ def filtered_posts():
         query = query.filter(XPost.text.ilike(f"%{text[:200]}%"))
     author = request.args.get("author")
     if author:
-        query = query.filter(XPost.author_id == author)
+        author = author.strip().removeprefix("@")[:100]
+        query = query.filter(or_(XPost.author_id == author, XPost.author.has(or_(
+            func.lower(XAuthor.username) == author.lower(), XAuthor.name.ilike(f"%{author}%")))))
     if request.args.get("rule_id", type=int):
         query = query.filter(XPost.source_rule_id == request.args.get("rule_id", type=int))
     if request.args.get("type") in ("original", "reply", "quote", "repost"):
@@ -252,14 +256,18 @@ def export_posts():
     if file_format not in ("csv", "xlsx"):
         return jsonify({"error": "format deve ser csv ou xlsx"}), 400
     posts = filtered_posts().order_by(XPost.created_at.desc()).limit(10000).all()
-    fields = ["post_id", "created_at", "author_id", "text", "post_url", "post_type", "is_relevant", "like_count", "reply_count", "repost_count", "quote_count"]
+    fields = ["post_id", "created_at", "author_id", "author_username", "author_name", "text", "post_url", "post_type", "is_relevant", "like_count", "reply_count", "repost_count", "quote_count"]
+    def value(post, field):
+        if field in ("author_username", "author_name"):
+            return getattr(post.author, field.removeprefix("author_"), None) if post.author else None
+        return getattr(post, field)
     output = io.BytesIO()
     if file_format == "csv":
         text_stream = io.StringIO()
         writer = csv.DictWriter(text_stream, fieldnames=fields)
         writer.writeheader()
         for post in posts:
-            writer.writerow({field: getattr(post, field) for field in fields})
+            writer.writerow({field: value(post, field) for field in fields})
         output.write(text_stream.getvalue().encode("utf-8-sig"))
         mime, filename = "text/csv", "posts.csv"
     else:
@@ -268,7 +276,7 @@ def export_posts():
         sheet = workbook.active
         sheet.append(fields)
         for post in posts:
-            sheet.append([str(getattr(post, field) or "") for field in fields])
+            sheet.append([str(value(post, field) or "") for field in fields])
         workbook.save(output)
         mime, filename = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "posts.xlsx"
     output.seek(0)

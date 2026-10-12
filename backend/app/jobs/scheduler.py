@@ -1,4 +1,6 @@
 import logging
+import os
+import time
 from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -123,12 +125,23 @@ def process_captures():
                 db.session.add(SystemLog(level="ERROR", source=f"capture:{capture_id}", message=str(exc)[:1000]))
                 db.session.commit()
 
-def acquire_lock():
-    if db.engine.dialect.name == "postgresql":
-        acquired = db.session.execute(text("SELECT pg_try_advisory_lock(741852963)" )).scalar()
+def acquire_lock(timeout=None, interval=5):
+    # Durante um redeploy o Railway mantém o container antigo rodando por alguns minutos;
+    # em vez de encerrar na hora, espera o lock ser liberado.
+    if db.engine.dialect.name != "postgresql":
+        return
+    timeout = int(os.getenv("WORKER_LOCK_WAIT_SECONDS", "600")) if timeout is None else timeout
+    deadline = time.monotonic() + timeout
+    while True:
+        acquired = db.session.execute(text("SELECT pg_try_advisory_lock(741852963)")).scalar()
         db.session.commit()
-        if not acquired:
-            raise RuntimeError("Já existe uma instância ativa do worker")
+        if acquired:
+            logging.info("Lock do worker adquirido")
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Já existe uma instância ativa do worker (aguardou {timeout}s)")
+        logging.warning("Outra instância do worker ainda está ativa; nova tentativa em %ss", interval)
+        time.sleep(interval)
 
 
 def main():
