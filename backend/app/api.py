@@ -120,10 +120,15 @@ def run_rule(rule_id):
     rule = db.session.get(MonitoringRule, rule_id)
     if not rule:
         return jsonify({"error": "Regra não encontrada"}), 404
-    from .jobs.scheduler import run_rule as execute_rule
-    execute_rule(rule.id)
-    db.session.refresh(rule)
-    return jsonify({"message": "Execução concluída", "rule": serialize_rule(rule)}), 200
+    if rule.status != "active":
+        return jsonify({"error": "Ative a regra para executá-la"}), 400
+    # A coleta roda no worker: executá-la aqui podia passar do timeout do gunicorn
+    # quando a API do X pede para aguardar (429). Sem last_run_at, o dispatch_rules
+    # executa a regra no próximo ciclo (até 1 minuto).
+    rule.last_run_at = None
+    db.session.commit()
+    return jsonify({"message": "Execução agendada: o worker vai coletar esta regra em até 1 minuto.",
+                    "rule": serialize_rule(rule)}), 202
 
 
 @api.post("/captures")
@@ -183,9 +188,17 @@ def filtered_posts():
         if raw:
             try:
                 value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                query = query.filter(XPost.created_at >= value if operator == "ge" else XPost.created_at <= value)
             except ValueError:
-                pass
+                continue
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            if operator == "ge":
+                query = query.filter(XPost.created_at >= value)
+            elif len(raw) == 10:
+                # Só a data (AAAA-MM-DD): inclui o dia inteiro.
+                query = query.filter(XPost.created_at < value + timedelta(days=1))
+            else:
+                query = query.filter(XPost.created_at <= value)
     return query
 
 
