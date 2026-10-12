@@ -53,7 +53,7 @@ def run_rule(rule_id):
 def dispatch_rules():
     with app.app_context():
         now = datetime.now(timezone.utc)
-        rules = MonitoringRule.query.filter_by(status="active").all()
+        rules = db.session.query(MonitoringRule).filter_by(status="active").all()
         due_ids = [rule.id for rule in rules if not rule.last_run_at or rule.last_run_at + timedelta(minutes=rule.interval_minutes) <= now]
     for rule_id in due_ids:
         run_rule(rule_id)

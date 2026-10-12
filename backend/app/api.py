@@ -66,7 +66,7 @@ def login():
 @api.get("/rules")
 @require_auth
 def list_rules():
-    return jsonify([serialize_rule(rule) for rule in MonitoringRule.query.order_by(MonitoringRule.id.desc()).all()])
+    return jsonify([serialize_rule(rule) for rule in db.session.query(MonitoringRule).order_by(MonitoringRule.id.desc()).all()])
 
 
 @api.post("/rules")
@@ -217,8 +217,8 @@ def stats():
     counts = {}
     for hours, label in ((6, "6h"), (12, "12h"), (24, "24h"), (168, "7d")):
         counts[label] = XPost.query.filter(XPost.created_at >= now - timedelta(hours=hours)).count()
-    return jsonify({"posts": counts, "rules": {"active": MonitoringRule.query.filter_by(status="active").count(),
-                    "total": MonitoringRule.query.count()}, "latest_post_at": db.session.query(func.max(XPost.created_at)).scalar().isoformat()
+    return jsonify({"posts": counts, "rules": {"active": db.session.query(MonitoringRule).filter_by(status="active").count(),
+                    "total": db.session.query(MonitoringRule).count()}, "latest_post_at": db.session.query(func.max(XPost.created_at)).scalar().isoformat()
                     if db.session.query(func.max(XPost.created_at)).scalar() else None})
 
 
