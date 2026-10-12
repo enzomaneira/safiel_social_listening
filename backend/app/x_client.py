@@ -15,21 +15,23 @@ class XClient:
         "user.fields": "username,name,verified,public_metrics",
     }
 
-    def __init__(self, token):
+    def __init__(self, token, max_attempts=4, timeout=20):
+        self.max_attempts, self.timeout = max_attempts, timeout
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"Bearer {token}"})
 
     def get(self, path, params=None):
-        for attempt in range(4):
+        last = self.max_attempts - 1
+        for attempt in range(self.max_attempts):
             try:
-                response = self.session.get(f"{self.BASE}{path}", params=params, timeout=20)
+                response = self.session.get(f"{self.BASE}{path}", params=params, timeout=self.timeout)
             except (requests.Timeout, requests.ConnectionError) as exc:
-                if attempt == 3:
+                if attempt == last:
                     raise XAPIError("Falha de conexão com a API do X") from exc
                 time.sleep(2 ** attempt)
                 continue
             if response.status_code == 429:
-                if attempt == 3:
+                if attempt == last:
                     raise XAPIError("Limite de requisições da API do X atingido")
                 try:
                     wait = int(response.headers.get("retry-after", 2 ** attempt * 5))
@@ -54,6 +56,10 @@ class XClient:
 
     def get_post(self, post_id):
         return self.get(f"/tweets/{post_id}", self.FIELDS)
+
+    def get_usage(self, days=30):
+        params = {"days": days, "usage.fields": "cap_reset_day,daily_project_usage,project_cap,project_usage"}
+        return self.get("/usage/tweets", params)
 
     def get_quotes(self, post_id, pagination_token=None):
         params = {**self.FIELDS, "max_results": 100}

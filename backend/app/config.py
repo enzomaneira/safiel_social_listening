@@ -15,5 +15,6 @@ class Config:
     X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "")
     MONTHLY_BUDGET_USD = float(os.getenv("MONTHLY_BUDGET_USD", "50"))
     POST_PRICE_USD = float(os.getenv("POST_PRICE_USD", "0.005"))
+    USER_PRICE_USD = float(os.getenv("USER_PRICE_USD", "0.010"))
     ALERT_THRESHOLDS = [int(value) for value in os.getenv("ALERT_THRESHOLDS", "70,85,95").split(",")]
     CORS_ORIGIN = os.getenv("CORS_ORIGIN", "*")

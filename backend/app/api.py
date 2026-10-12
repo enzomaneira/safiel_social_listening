@@ -1,6 +1,7 @@
 import csv
 import io
 import re
+import time
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 
@@ -11,6 +12,8 @@ from sqlalchemy import func, or_
 
 from .extensions import db
 from .models import ApiUsage, Capture, MonitoringRule, SystemLog, XAuthor, XPost
+from .services import month_spend
+from .x_client import XAPIError, XClient
 
 api = Blueprint("api", __name__)
 
@@ -93,6 +96,11 @@ def update_rule(rule_id):
     if not rule:
         return jsonify({"error": "Regra não encontrada"}), 404
     data = request.get_json(silent=True) or {}
+    budget = current_app.config["MONTHLY_BUDGET_USD"]
+    priority = int(data.get("priority", rule.priority or 2))
+    if data.get("status") == "active" and priority != 1 and budget and month_spend() >= budget:
+        return jsonify({"error": "Orçamento mensal atingido: só regras de prioridade alta podem ser ativadas. "
+                                 "Aumente o orçamento ou mude a prioridade da regra para Alta."}), 400
     for key, field in (("name", "name"), ("query", "query"), ("group", "grp"), ("priority", "priority"),
                        ("interval_minutes", "interval_minutes"), ("max_results_per_run", "max_results_per_run"),
                        ("status", "status")):
@@ -120,6 +128,8 @@ def run_rule(rule_id):
     rule = db.session.get(MonitoringRule, rule_id)
     if not rule:
         return jsonify({"error": "Regra não encontrada"}), 404
+    if rule.status == "suspended_budget":
+        return jsonify({"error": "Regra suspensa porque o orçamento mensal foi atingido"}), 400
     if rule.status != "active":
         return jsonify({"error": "Ative a regra para executá-la"}), 400
     # A coleta roda no worker: executá-la aqui podia passar do timeout do gunicorn
@@ -239,16 +249,43 @@ def stats():
                     if db.session.query(func.max(XPost.created_at)).scalar() else None})
 
 
+_x_usage_cache = {"at": 0.0, "value": None}
+
+
+def official_x_usage():
+    """Consumo oficial da X API (GET /2/usage/tweets), em cache por 10 minutos."""
+    if time.monotonic() - _x_usage_cache["at"] < 600:
+        return _x_usage_cache["value"]
+    token = current_app.config["X_BEARER_TOKEN"]
+    if not token:
+        value = {"error": "X_BEARER_TOKEN não configurado"}
+    else:
+        try:
+            data = XClient(token, max_attempts=1, timeout=8).get_usage().get("data") or {}
+            daily = (data.get("daily_project_usage") or {}).get("usage") or []
+            value = {"project_usage": int(data["project_usage"]) if data.get("project_usage") is not None else None,
+                     "project_cap": int(data["project_cap"]) if data.get("project_cap") is not None else None,
+                     "cap_reset_day": data.get("cap_reset_day"),
+                     "daily": [{"date": str(item.get("date", ""))[:10], "usage": int(item.get("usage") or 0)} for item in daily]}
+        except (XAPIError, ValueError, KeyError, TypeError) as exc:
+            value = {"error": str(exc)[:300]}
+    _x_usage_cache.update(at=time.monotonic(), value=value)
+    return value
+
+
 @api.get("/usage")
 @require_auth
 def usage():
-    first_day = date.today().replace(day=1)
-    rows = ApiUsage.query.filter(ApiUsage.date >= first_day).all()
-    spend = sum(float(row.est_cost_usd or 0) for row in rows)
+    first_day = datetime.now(timezone.utc).date().replace(day=1)
+    rows = ApiUsage.query.filter(ApiUsage.date >= first_day).order_by(ApiUsage.date.desc()).all()
+    spend = month_spend()
     budget = current_app.config["MONTHLY_BUDGET_USD"]
     pct = round((spend / budget) * 100, 1) if budget else 0
-    return jsonify({"month_spend_usd": spend, "budget_usd": budget, "percent": pct,
+    suspended = db.session.query(MonitoringRule).filter_by(status="suspended_budget").count()
+    return jsonify({"month_spend_usd": spend, "budget_usd": budget, "percent": pct, "suspended_rules": suspended,
+                    "prices": {"post_usd": current_app.config["POST_PRICE_USD"], "user_usd": current_app.config["USER_PRICE_USD"]},
                     "alerts": [threshold for threshold in current_app.config["ALERT_THRESHOLDS"] if pct >= threshold],
+                    "x_usage": official_x_usage(),
                     "by_day": [{"date": row.date.isoformat(), "endpoint": row.endpoint, "requests": row.requests,
                                 "resources_read": row.resources_read, "est_cost_usd": float(row.est_cost_usd or 0)} for row in rows]})
 

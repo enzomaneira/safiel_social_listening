@@ -9,7 +9,7 @@ from sqlalchemy import text
 from app import create_app
 from app.extensions import db
 from app.models import Capture, MonitoringRule, SystemLog
-from app.services import upsert_posts
+from app.services import month_spend, upsert_posts
 from app.x_client import XAPIError, XClient
 
 logging.basicConfig(level=logging.INFO)
@@ -32,16 +32,31 @@ def run_rule(rule_id):
             if not token:
                 raise XAPIError("X_BEARER_TOKEN não está configurado")
             client = XClient(token)
-            result = client.search_recent(rule.query, since_id=rule.since_id, max_results=100)
-            tweets = result.get("data") or []
-            created, existing = upsert_posts(tweets, result.get("includes"), rule_id=rule.id,
-                                             endpoint="search_recent", price=app.config["POST_PRICE_USD"])
-            meta = result.get("meta") or {}
-            rule.since_id = meta.get("newest_id") or rule.since_id
+            limit = max(10, rule.max_results_per_run or 100)
+            fetched = created = existing = pages = 0
+            newest_id = next_token = None
+            # Pagina a Recent Search até esgotar os resultados ou atingir o limite da regra.
+            while True:
+                result = client.search_recent(rule.query, since_id=rule.since_id, next_token=next_token,
+                                              max_results=min(100, limit - fetched))
+                tweets = result.get("data") or []
+                meta = result.get("meta") or {}
+                newest_id = newest_id or meta.get("newest_id")
+                page_created, page_existing = upsert_posts(tweets, result.get("includes"), rule_id=rule.id,
+                                                           endpoint="search_recent", price=app.config["POST_PRICE_USD"],
+                                                           user_price=app.config["USER_PRICE_USD"])
+                created, existing, fetched, pages = created + page_created, existing + page_existing, fetched + len(tweets), pages + 1
+                next_token = meta.get("next_token")
+                if not next_token or fetched >= limit:
+                    break
+            rule.since_id = newest_id or rule.since_id
             rule.last_run_at = datetime.now(timezone.utc)
             rule.last_error = None
-            logging.info("Regra %s (%s): %s novos, %s existentes", rule.id, rule.name, created, existing)
-            db.session.add(SystemLog(level="INFO", source="radar", message=f"Regra {rule.name}: {created} novos, {existing} existentes"))
+            message = f"Regra {rule.name}: {created} novos, {existing} existentes ({pages} página(s))"
+            if next_token:
+                message += f"; limite de {limit} posts por execução atingido, posts mais antigos desta janela não foram coletados"
+            logging.info("Regra %s - %s", rule.id, message)
+            db.session.add(SystemLog(level="WARNING" if next_token else "INFO", source="radar", message=message[:1000]))
             db.session.commit()
         except Exception as exc:
             db.session.rollback()
@@ -54,8 +69,35 @@ def run_rule(rule_id):
                 db.session.commit()
 
 
+def enforce_budget():
+    """Ao atingir o orçamento mensal, suspende as regras não prioritárias; abaixo dele, reativa-as."""
+    budget = app.config["MONTHLY_BUDGET_USD"]
+    if not budget:
+        return
+    spend = month_spend()
+    if spend >= budget:
+        rules = db.session.query(MonitoringRule).filter(MonitoringRule.status == "active", MonitoringRule.priority != 1).all()
+        for rule in rules:
+            rule.status = "suspended_budget"
+        if rules:
+            message = (f"Orçamento mensal atingido (US$ {spend:.2f} de US$ {budget:.2f}): "
+                       f"{len(rules)} regra(s) não prioritária(s) suspensa(s); regras de prioridade alta continuam ativas")
+            logging.warning(message)
+            db.session.add(SystemLog(level="WARNING", source="budget", message=message))
+    else:
+        rules = db.session.query(MonitoringRule).filter_by(status="suspended_budget").all()
+        for rule in rules:
+            rule.status = "active"
+        if rules:
+            message = f"Gasto abaixo do orçamento (US$ {spend:.2f} de US$ {budget:.2f}): {len(rules)} regra(s) reativada(s)"
+            logging.info(message)
+            db.session.add(SystemLog(level="INFO", source="budget", message=message))
+    db.session.commit()
+
+
 def dispatch_rules():
     with app.app_context():
+        enforce_budget()
         now = datetime.now(timezone.utc)
         rules = db.session.query(MonitoringRule).filter_by(status="active").all()
         due_ids = [rule.id for rule in rules if not rule.last_run_at or rule.last_run_at + timedelta(minutes=rule.interval_minutes) <= now]
@@ -107,7 +149,8 @@ def process_captures():
                     break
             unique_posts = {str(item["id"]): item for item in collected if item.get("id")}
             upsert_posts(list(unique_posts.values()), includes, capture_id=capture_id,
-                         endpoint="capture", price=app.config["POST_PRICE_USD"])
+                         endpoint="capture", price=app.config["POST_PRICE_USD"], user_price=app.config["USER_PRICE_USD"])
+            logging.info("Captura %s: %s respostas, %s quotes, %s posts salvos", capture_id, replies, quotes, len(unique_posts))
             with app.app_context():
                 current = db.session.get(Capture, capture_id)
                 if current:

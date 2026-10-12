@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
 
 from .extensions import db
@@ -7,7 +8,13 @@ from .models import ApiUsage, XAuthor, XPost
 from .normalizer import normalize
 
 
-def upsert_posts(tweets, includes=None, rule_id=None, capture_id=None, endpoint="unknown", price=0.005):
+def month_spend():
+    """Custo estimado acumulado no mês corrente (UTC)."""
+    first_day = datetime.now(timezone.utc).date().replace(day=1)
+    return float(db.session.query(func.coalesce(func.sum(ApiUsage.est_cost_usd), 0)).filter(ApiUsage.date >= first_day).scalar())
+
+
+def upsert_posts(tweets, includes=None, rule_id=None, capture_id=None, endpoint="unknown", price=0.005, user_price=0.0):
     includes = includes or {}
     users = {user["id"]: user for user in includes.get("users", [])}
     authors_to_store = dict(users)
@@ -44,11 +51,13 @@ def upsert_posts(tweets, includes=None, rule_id=None, capture_id=None, endpoint=
     now = datetime.now(timezone.utc).date()
     usage = db.session.get(ApiUsage, (now, endpoint))
     n = len(tweets)
+    # A X API cobra por recurso retornado: posts e também os usuários expandidos em includes.
+    cost = n * price + len(users) * user_price
     if usage:
         usage.requests += 1
         usage.resources_read += n
-        usage.est_cost_usd = float(usage.est_cost_usd or 0) + n * price
+        usage.est_cost_usd = float(usage.est_cost_usd or 0) + cost
     else:
-        db.session.add(ApiUsage(date=now, endpoint=endpoint, requests=1, resources_read=n, est_cost_usd=n * price))
+        db.session.add(ApiUsage(date=now, endpoint=endpoint, requests=1, resources_read=n, est_cost_usd=cost))
     db.session.commit()
     return len(ids) - len(existing_ids), len(existing_ids)
