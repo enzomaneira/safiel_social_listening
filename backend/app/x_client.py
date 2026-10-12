@@ -38,7 +38,7 @@ class XClient:
                 time.sleep(min(wait, 60))
                 continue
             if response.status_code in (401, 403):
-                raise XAPIError(f"Credencial ou permissão da API inválida ({response.status_code})")
+                raise XAPIError(f"Credencial ou permissão da API inválida ({response.status_code}): {response.text[:300]}")
             if not response.ok:
                 raise XAPIError(f"Erro da API do X ({response.status_code}): {response.text[:500]}")
             return response.json()

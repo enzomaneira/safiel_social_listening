@@ -40,6 +40,7 @@ def run_rule(rule_id):
             rule.since_id = meta.get("newest_id") or rule.since_id
             rule.last_run_at = datetime.now(timezone.utc)
             rule.last_error = None
+            logging.info("Regra %s (%s): %s novos, %s existentes", rule.id, rule.name, created, existing)
             db.session.add(SystemLog(level="INFO", source="radar", message=f"Regra {rule.name}: {created} novos, {existing} existentes"))
             db.session.commit()
         except Exception as exc:
@@ -48,6 +49,7 @@ def run_rule(rule_id):
             if current:
                 current.last_error = str(exc)[:1000]
                 current.last_run_at = datetime.now(timezone.utc)
+                logging.error("Regra %s falhou: %s", rule_id, exc)
                 db.session.add(SystemLog(level="ERROR", source=f"rule:{rule_id}", message=str(exc)[:1000]))
                 db.session.commit()
 
@@ -122,6 +124,7 @@ def process_captures():
                 current.status = "error"
                 current.error = str(exc)[:1000]
                 current.finished_at = datetime.now(timezone.utc)
+                logging.error("Captura %s falhou: %s", capture_id, exc)
                 db.session.add(SystemLog(level="ERROR", source=f"capture:{capture_id}", message=str(exc)[:1000]))
                 db.session.commit()
 
