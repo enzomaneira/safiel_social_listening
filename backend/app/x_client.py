@@ -10,7 +10,7 @@ class XAPIError(RuntimeError):
 class XClient:
     BASE = "https://api.x.com/2"
     FIELDS = {
-        "tweet.fields": "created_at,conversation_id,author_id,public_metrics,referenced_tweets,in_reply_to_user_id,lang,entities,text",
+        "tweet.fields": "created_at,conversation_id,author_id,public_metrics,referenced_tweets,in_reply_to_user_id,lang,entities,text,note_tweet",
         "expansions": "author_id",
         "user.fields": "username,name,verified,public_metrics",
     }
