@@ -11,8 +11,8 @@ from flask import Blueprint, current_app, jsonify, request, send_file
 from sqlalchemy import func, or_
 
 from .extensions import db
-from .models import ApiUsage, Capture, MonitoringRule, SystemLog, XAuthor, XPost
-from .services import month_spend
+from .models import AIClassification, ApiUsage, Capture, MonitoringRule, SystemLog, XAuthor, XMetricSnapshot, XPost
+from .services import month_spend, take_snapshot
 from .x_client import XAPIError, XClient
 
 api = Blueprint("api", __name__)
@@ -48,7 +48,10 @@ def serialize_post(post):
             "created_at": post.created_at.isoformat() if post.created_at else None,
             "post_url": post.post_url, "post_type": post.post_type, "is_relevant": post.is_relevant,
             "like_count": post.like_count, "reply_count": post.reply_count,
-            "repost_count": post.repost_count, "quote_count": post.quote_count}
+            "repost_count": post.repost_count, "quote_count": post.quote_count,
+            "impression_count": post.impression_count, "bookmark_count": post.bookmark_count,
+            "conversation_id": post.conversation_id, "in_reply_to_post_id": post.in_reply_to_post_id,
+            "quoted_post_id": post.quoted_post_id}
 
 
 @api.post("/auth/login")
@@ -176,8 +179,56 @@ def get_capture(capture_id):
                     "finished_at": c.finished_at.isoformat() if c.finished_at else None})
 
 
+def capture_scope(capture):
+    """Posts de uma captura: o post raiz, toda a conversa dele e os quotes do post."""
+    root = db.session.get(XPost, capture.root_post_id)
+    conversation_id = (root.conversation_id if root else None) or capture.root_post_id
+    return conversation_id, or_(XPost.post_id == capture.root_post_id, XPost.conversation_id == conversation_id,
+                                XPost.quoted_post_id == capture.root_post_id)
+
+
+@api.get("/captures/<int:capture_id>/tree")
+@require_auth
+def capture_tree(capture_id):
+    capture = db.session.get(Capture, capture_id)
+    if not capture:
+        return jsonify({"error": "Captura não encontrada"}), 404
+    conversation_id, scope = capture_scope(capture)
+    posts = XPost.query.filter(scope).order_by(XPost.created_at.asc()).limit(2000).all()
+    conversation = [post for post in posts if post.conversation_id == conversation_id or post.post_id == conversation_id]
+    quotes = [post for post in posts if post.quoted_post_id == capture.root_post_id and post not in conversation]
+    by_id = {post.post_id: post for post in conversation}
+    root_id = conversation_id if conversation_id in by_id else capture.root_post_id
+    children = {}
+    for post in conversation:
+        if post.post_id == root_id:
+            continue
+        parent = post.in_reply_to_post_id if post.in_reply_to_post_id in by_id else root_id
+        children.setdefault(parent, []).append(post)
+    # Percorre a árvore em profundidade, reconstruída por referenced_tweets (replied_to).
+    ordered, stack, seen = [], ([(by_id[root_id], 0)] if root_id in by_id else []), set()
+    while stack:
+        post, depth = stack.pop()
+        if post.post_id in seen:
+            continue
+        seen.add(post.post_id)
+        item = serialize_post(post)
+        item.update(depth=depth, parent_missing=bool(post.in_reply_to_post_id and post.in_reply_to_post_id not in by_id
+                                                        and post.post_id != root_id))
+        ordered.append(item)
+        stack.extend((child, depth + 1) for child in reversed(children.get(post.post_id, [])))
+    ordered.extend(dict(serialize_post(post), depth=1, parent_missing=True) for post in conversation if post.post_id not in seen)
+    return jsonify({"capture_id": capture.id, "root_post_id": capture.root_post_id, "conversation_id": conversation_id,
+                    "root_found": root_id in by_id, "conversation": ordered,
+                    "quotes": [serialize_post(post) for post in quotes]})
+
+
 def filtered_posts():
     query = XPost.query
+    capture_id = request.args.get("capture_id", type=int)
+    if capture_id:
+        capture = db.session.get(Capture, capture_id)
+        query = query.filter(capture_scope(capture)[1]) if capture else query.filter(False)
     text = request.args.get("q")
     if text:
         query = query.filter(XPost.text.ilike(f"%{text[:200]}%"))
@@ -232,9 +283,34 @@ def update_post(post_id):
     data = request.get_json(silent=True) or {}
     if "is_relevant" not in data or not isinstance(data["is_relevant"], bool):
         return jsonify({"error": "is_relevant boolean é obrigatório"}), 400
+    if data["is_relevant"] and not post.is_relevant:
+        take_snapshot(post)
     post.is_relevant = data["is_relevant"]
     db.session.commit()
     return jsonify(serialize_post(post))
+
+
+@api.get("/posts/<post_id>/snapshots")
+@require_auth
+def post_snapshots(post_id):
+    rows = (XMetricSnapshot.query.filter_by(post_id=post_id).order_by(XMetricSnapshot.captured_at.desc()).limit(200).all())
+    return jsonify([{"captured_at": row.captured_at.isoformat() if row.captured_at else None, "like_count": row.like_count,
+                     "reply_count": row.reply_count, "repost_count": row.repost_count, "quote_count": row.quote_count,
+                     "impression_count": row.impression_count} for row in rows])
+
+
+@api.delete("/posts/<post_id>")
+@require_auth
+def delete_post(post_id):
+    post = db.session.get(XPost, post_id)
+    if not post:
+        return jsonify({"error": "Post não encontrado"}), 404
+    XMetricSnapshot.query.filter_by(post_id=post_id).delete()
+    AIClassification.query.filter_by(post_id=post_id).delete()
+    db.session.delete(post)
+    db.session.add(SystemLog(level="INFO", source="posts", message=f"Post {post_id} removido pelo painel"))
+    db.session.commit()
+    return "", 204
 
 
 @api.get("/stats")
@@ -299,6 +375,24 @@ def status():
                     "recent_errors": [{"ts": log.ts.isoformat(), "source": log.source, "message": log.message} for log in errors]})
 
 
+EXPORT_FIELDS = ["post_id", "created_at", "author_id", "author_username", "author_name", "text", "post_url", "post_type",
+                 "is_relevant", "language", "conversation_id", "in_reply_to_post_id", "quoted_post_id",
+                 "like_count", "reply_count", "repost_count", "quote_count", "bookmark_count", "impression_count",
+                 "hashtags", "mentions", "urls", "source_rule_id", "source_capture_id", "first_collected_at"]
+
+
+def export_value(post, field):
+    if field in ("author_username", "author_name"):
+        return getattr(post.author, field.removeprefix("author_"), None) if post.author else None
+    value = getattr(post, field)
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value if item)
+    if isinstance(value, datetime):
+        # Excel não aceita datas com fuso; exporta em UTC sem tzinfo.
+        return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+    return value
+
+
 @api.get("/export")
 @require_auth
 def export_posts():
@@ -306,28 +400,32 @@ def export_posts():
     if file_format not in ("csv", "xlsx"):
         return jsonify({"error": "format deve ser csv ou xlsx"}), 400
     posts = filtered_posts().order_by(XPost.created_at.desc()).limit(10000).all()
-    fields = ["post_id", "created_at", "author_id", "author_username", "author_name", "text", "post_url", "post_type", "is_relevant", "like_count", "reply_count", "repost_count", "quote_count"]
-    def value(post, field):
-        if field in ("author_username", "author_name"):
-            return getattr(post.author, field.removeprefix("author_"), None) if post.author else None
-        return getattr(post, field)
+    capture_id = request.args.get("capture_id", type=int)
+    basename = f"captura-{capture_id}" if capture_id else "posts"
     output = io.BytesIO()
     if file_format == "csv":
         text_stream = io.StringIO()
-        writer = csv.DictWriter(text_stream, fieldnames=fields)
-        writer.writeheader()
+        # Ponto e vírgula: separador que o Excel em português espera ao abrir um CSV.
+        writer = csv.writer(text_stream, delimiter=";")
+        writer.writerow(EXPORT_FIELDS)
         for post in posts:
-            writer.writerow({field: value(post, field) for field in fields})
+            row = []
+            for field in EXPORT_FIELDS:
+                value = export_value(post, field)
+                row.append(value.strftime("%Y-%m-%d %H:%M:%S") if isinstance(value, datetime) else value)
+            writer.writerow(row)
         output.write(text_stream.getvalue().encode("utf-8-sig"))
-        mime, filename = "text/csv", "posts.csv"
+        mime, filename = "text/csv", f"{basename}.csv"
     else:
         from openpyxl import Workbook
         workbook = Workbook()
         sheet = workbook.active
-        sheet.append(fields)
+        sheet.title = "Posts"
+        sheet.append(EXPORT_FIELDS)
         for post in posts:
-            sheet.append([str(value(post, field) or "") for field in fields])
+            sheet.append([export_value(post, field) for field in EXPORT_FIELDS])
+        sheet.freeze_panes = "A2"
         workbook.save(output)
-        mime, filename = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "posts.xlsx"
+        mime, filename = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", f"{basename}.xlsx"
     output.seek(0)
     return send_file(output, mimetype=mime, as_attachment=True, download_name=filename)

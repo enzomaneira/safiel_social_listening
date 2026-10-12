@@ -16,5 +16,8 @@ class Config:
     MONTHLY_BUDGET_USD = float(os.getenv("MONTHLY_BUDGET_USD", "50"))
     POST_PRICE_USD = float(os.getenv("POST_PRICE_USD", "0.005"))
     USER_PRICE_USD = float(os.getenv("USER_PRICE_USD", "0.010"))
+    CAPTURE_MAX_POSTS = int(os.getenv("CAPTURE_MAX_POSTS", "1000"))
+    SNAPSHOT_INTERVAL_MINUTES = int(os.getenv("SNAPSHOT_INTERVAL_MINUTES", "360"))
+    SNAPSHOT_MAX_POSTS = int(os.getenv("SNAPSHOT_MAX_POSTS", "200"))
     ALERT_THRESHOLDS = [int(value) for value in os.getenv("ALERT_THRESHOLDS", "70,85,95").split(",")]
     CORS_ORIGIN = os.getenv("CORS_ORIGIN", "*")

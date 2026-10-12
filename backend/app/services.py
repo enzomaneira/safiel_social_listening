@@ -4,7 +4,7 @@ from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
 
 from .extensions import db
-from .models import ApiUsage, XAuthor, XPost
+from .models import ApiUsage, XAuthor, XMetricSnapshot, XPost
 from .normalizer import normalize
 
 
@@ -12,6 +12,24 @@ def month_spend():
     """Custo estimado acumulado no mês corrente (UTC)."""
     first_day = datetime.now(timezone.utc).date().replace(day=1)
     return float(db.session.query(func.coalesce(func.sum(ApiUsage.est_cost_usd), 0)).filter(ApiUsage.date >= first_day).scalar())
+
+
+def record_usage(endpoint, resources, cost):
+    today = datetime.now(timezone.utc).date()
+    usage = db.session.get(ApiUsage, (today, endpoint))
+    if usage:
+        usage.requests += 1
+        usage.resources_read += resources
+        usage.est_cost_usd = float(usage.est_cost_usd or 0) + cost
+    else:
+        db.session.add(ApiUsage(date=today, endpoint=endpoint, requests=1, resources_read=resources, est_cost_usd=cost))
+
+
+def take_snapshot(post):
+    """Registra as métricas atuais do post no histórico."""
+    db.session.add(XMetricSnapshot(post_id=post.post_id, like_count=post.like_count, reply_count=post.reply_count,
+                                   repost_count=post.repost_count, quote_count=post.quote_count,
+                                   impression_count=post.impression_count))
 
 
 def upsert_posts(tweets, includes=None, rule_id=None, capture_id=None, endpoint="unknown", price=0.005, user_price=0.0):
@@ -48,16 +66,8 @@ def upsert_posts(tweets, includes=None, rule_id=None, capture_id=None, endpoint=
         statement = statement.on_conflict_do_update(index_elements=["post_id"],
                     set_={column: getattr(statement.excluded, column) for column in update_columns})
         db.session.execute(statement)
-    now = datetime.now(timezone.utc).date()
-    usage = db.session.get(ApiUsage, (now, endpoint))
     n = len(tweets)
     # A X API cobra por recurso retornado: posts e também os usuários expandidos em includes.
-    cost = n * price + len(users) * user_price
-    if usage:
-        usage.requests += 1
-        usage.resources_read += n
-        usage.est_cost_usd = float(usage.est_cost_usd or 0) + cost
-    else:
-        db.session.add(ApiUsage(date=now, endpoint=endpoint, requests=1, resources_read=n, est_cost_usd=cost))
+    record_usage(endpoint, n, n * price + len(users) * user_price)
     db.session.commit()
     return len(ids) - len(existing_ids), len(existing_ids)

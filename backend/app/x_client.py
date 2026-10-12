@@ -57,6 +57,10 @@ class XClient:
     def get_post(self, post_id):
         return self.get(f"/tweets/{post_id}", self.FIELDS)
 
+    def lookup_posts(self, post_ids):
+        """Busca até 100 posts por ID (só métricas públicas)."""
+        return self.get("/tweets", {"ids": ",".join(post_ids), "tweet.fields": "public_metrics"})
+
     def get_usage(self, days=30):
         params = {"days": days, "usage.fields": "cap_reset_day,daily_project_usage,project_cap,project_usage"}
         return self.get("/usage/tweets", params)

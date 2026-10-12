@@ -8,8 +8,8 @@ from sqlalchemy import text
 
 from app import create_app
 from app.extensions import db
-from app.models import Capture, MonitoringRule, SystemLog
-from app.services import month_spend, upsert_posts
+from app.models import Capture, MonitoringRule, SystemLog, XPost
+from app.services import month_spend, record_usage, take_snapshot, upsert_posts
 from app.x_client import XAPIError, XClient
 
 logging.basicConfig(level=logging.INFO)
@@ -123,6 +123,7 @@ def process_captures():
             if not original:
                 raise XAPIError("Post não encontrado ou indisponível")
             root_id = original.get("conversation_id") or post_id
+            max_posts = max(10, app.config["CAPTURE_MAX_POSTS"])
             collected = [original]
             includes = {"users": list(original_result.get("includes", {}).get("users", []))}
             replies = 0
@@ -135,7 +136,7 @@ def process_captures():
                 includes["users"].extend(search.get("includes", {}).get("users", []))
                 replies += sum(1 for item in batch if item.get("id") != post_id)
                 search_token = (search.get("meta") or {}).get("next_token")
-                if not search_token or len(collected) >= 500:
+                if not search_token or len(collected) >= max_posts // 2:
                     break
             quote_token = None
             while True:
@@ -145,7 +146,7 @@ def process_captures():
                 includes["users"].extend(quoted.get("includes", {}).get("users", []))
                 quotes += len(batch)
                 quote_token = (quoted.get("meta") or {}).get("next_token")
-                if not quote_token or len(collected) >= 1000:
+                if not quote_token or len(collected) >= max_posts:
                     break
             unique_posts = {str(item["id"]): item for item in collected if item.get("id")}
             upsert_posts(list(unique_posts.values()), includes, capture_id=capture_id,
@@ -170,6 +171,55 @@ def process_captures():
                 logging.error("Captura %s falhou: %s", capture_id, exc)
                 db.session.add(SystemLog(level="ERROR", source=f"capture:{capture_id}", message=str(exc)[:1000]))
                 db.session.commit()
+
+def snapshot_relevant_posts():
+    """Atualiza as métricas dos posts marcados como relevantes e guarda o histórico."""
+    with app.app_context():
+        token = app.config["X_BEARER_TOKEN"]
+        budget = app.config["MONTHLY_BUDGET_USD"]
+        if not token:
+            return
+        if budget and month_spend() >= budget:
+            logging.warning("Snapshots de métricas adiados: orçamento mensal atingido")
+            return
+        posts = (db.session.query(XPost).filter(XPost.is_relevant.is_(True))
+                 .order_by(XPost.created_at.desc()).limit(app.config["SNAPSHOT_MAX_POSTS"]).all())
+        if not posts:
+            return
+        by_id = {post.post_id: post for post in posts}
+        ids = list(by_id)
+        updated = 0
+        try:
+            client = XClient(token)
+            for start in range(0, len(ids), 100):
+                chunk = ids[start:start + 100]
+                data = client.lookup_posts(chunk).get("data") or []
+                for item in data:
+                    post = by_id.get(str(item.get("id")))
+                    metrics = item.get("public_metrics") or {}
+                    if not post:
+                        continue
+                    post.like_count = metrics.get("like_count", post.like_count)
+                    post.reply_count = metrics.get("reply_count", post.reply_count)
+                    post.repost_count = metrics.get("retweet_count", post.repost_count)
+                    post.quote_count = metrics.get("quote_count", post.quote_count)
+                    post.bookmark_count = metrics.get("bookmark_count", post.bookmark_count)
+                    post.impression_count = metrics.get("impression_count", post.impression_count)
+                    post.last_updated_at = datetime.now(timezone.utc)
+                    take_snapshot(post)
+                    updated += 1
+                record_usage("metrics_snapshot", len(data), len(data) * app.config["POST_PRICE_USD"])
+                db.session.commit()
+            message = f"Snapshots de métricas: {updated} de {len(ids)} posts relevantes atualizados"
+            logging.info(message)
+            db.session.add(SystemLog(level="INFO", source="snapshots", message=message))
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            logging.error("Snapshots de métricas falharam: %s", exc)
+            db.session.add(SystemLog(level="ERROR", source="snapshots", message=str(exc)[:1000]))
+            db.session.commit()
+
 
 def acquire_lock(timeout=None, interval=5):
     # Durante um redeploy o Railway mantém o container antigo rodando por alguns minutos;
@@ -197,6 +247,8 @@ def main():
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(dispatch_rules, "interval", minutes=1, id="dispatch_rules", max_instances=1, coalesce=True)
     scheduler.add_job(process_captures, "interval", seconds=15, id="process_captures", max_instances=1, coalesce=True)
+    scheduler.add_job(snapshot_relevant_posts, "interval", minutes=max(15, app.config["SNAPSHOT_INTERVAL_MINUTES"]),
+                      id="snapshot_relevant_posts", max_instances=1, coalesce=True)
     scheduler.start()
 
 
