@@ -1,4 +1,10 @@
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 class Config:
@@ -31,5 +37,12 @@ class Config:
     REPORT_AI_EFFORT = os.getenv("REPORT_AI_EFFORT", "high")
     REPORT_MAX_POSTS = int(os.getenv("REPORT_MAX_POSTS", "300"))
     REPORT_CLASSIFY_LIMIT = int(os.getenv("REPORT_CLASSIFY_LIMIT", "400"))
-    ALERT_THRESHOLDS = [int(value) for value in os.getenv("ALERT_THRESHOLDS", "70,85,95").split(",")]
+    INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN", "")
+    # graph.instagram.com para tokens do "Instagram Login"; graph.facebook.com para tokens do "Facebook Login".
+    INSTAGRAM_API_BASE = os.getenv("INSTAGRAM_API_BASE", "https://graph.instagram.com/v25.0").rstrip("/")
+    # "me" funciona com Instagram Login; com Facebook Login informe o ID numérico da conta profissional.
+    INSTAGRAM_USER_ID = os.getenv("INSTAGRAM_USER_ID", "me")
+    INSTAGRAM_CAPTURE_MAX_COMMENTS = int(os.getenv("INSTAGRAM_CAPTURE_MAX_COMMENTS", "5000"))
+    INSTAGRAM_MEDIA_SCAN_LIMIT = int(os.getenv("INSTAGRAM_MEDIA_SCAN_LIMIT", "1000"))
+    ALERT_THRESHOLDS =[int(value) for value in os.getenv("ALERT_THRESHOLDS", "70,85,95").split(",")]
     CORS_ORIGIN = os.getenv("CORS_ORIGIN", "*")

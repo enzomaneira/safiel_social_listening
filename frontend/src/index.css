@@ -27,6 +27,9 @@ button:disabled { cursor: not-allowed; }
 .input { width:100%; outline:none; border:1px solid #e5e7eb; background:#fff; border-radius:8px; padding:10px 12px; color:#262a35; font-size:13px; transition:border-color .15s, box-shadow .15s; }
 .input:focus { border-color:#9d86f5; box-shadow:0 0 0 3px rgba(127,98,225,.1); }
 .input::placeholder { color:#a6a8b1; }
+/* .input fica fora das camadas do Tailwind e venceria o pl-* dos campos com ícone à esquerda. */
+.input.pl-8 { padding-left:2rem; }
+.input.pl-9 { padding-left:2.25rem; }
 .btn-primary { display:inline-flex; justify-content:center; align-items:center; gap:8px; background:#7560d7; color:#fff; border:1px solid #7560d7; border-radius:8px; padding:10px 14px; font-size:13px; font-weight:700; text-decoration:none; transition:background .15s,box-shadow .15s,transform .15s; }
 .btn-primary:hover { background:#6450c2; box-shadow:0 4px 12px rgba(117,96,215,.18); }
 .btn-primary:active { transform:translateY(1px); }

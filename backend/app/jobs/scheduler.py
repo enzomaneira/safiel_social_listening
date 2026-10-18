@@ -6,9 +6,9 @@ from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.blocking import BlockingScheduler
 from sqlalchemy import text
 
-from app import ai_classifier, create_app, reports
+from app import ai_classifier, create_app, instagram, reports
 from app.extensions import db
-from app.models import AIClassification, AISignal, Capture, MonitoringRule, Report, SystemLog, XPost
+from app.models import AIClassification, AISignal, Capture, IGCapture, MonitoringRule, Report, SystemLog, XPost
 from app.services import month_spend, record_usage, take_snapshot, upsert_posts
 from app.x_client import XAPIError, XClient
 
@@ -171,6 +171,35 @@ def process_captures():
                 logging.error("Captura %s falhou: %s", capture_id, exc)
                 db.session.add(SystemLog(level="ERROR", source=f"capture:{capture_id}", message=str(exc)[:1000]))
                 db.session.commit()
+
+
+def process_ig_captures():
+    """Coleta os comentários de um post da conta do Instagram conectada."""
+    with app.app_context():
+        capture = IGCapture.query.filter_by(status="queued").order_by(IGCapture.created_at).with_for_update(skip_locked=True).first()
+        if not capture:
+            return
+        capture.status = "running"
+        db.session.commit()
+        capture_id = capture.id
+        try:
+            client = instagram.load_client(app.config)
+            comments, replies = instagram.run_capture(capture_id, client, max(1, app.config["INSTAGRAM_CAPTURE_MAX_COMMENTS"]))
+            message = f"Captura Instagram {capture_id}: {comments} comentários e {replies} respostas salvos"
+            logging.info(message)
+            db.session.add(SystemLog(level="INFO", source=f"ig_capture:{capture_id}", message=message))
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            current = db.session.get(IGCapture, capture_id)
+            if current:
+                current.status = "error"
+                current.error = str(exc)[:1000]
+                current.finished_at = datetime.now(timezone.utc)
+                logging.error("Captura Instagram %s falhou: %s", capture_id, exc)
+                db.session.add(SystemLog(level="ERROR", source=f"ig_capture:{capture_id}", message=str(exc)[:1000]))
+                db.session.commit()
+
 
 def snapshot_relevant_posts():
     """Atualiza as métricas dos posts marcados como relevantes e guarda o histórico."""
@@ -366,6 +395,7 @@ def main():
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(dispatch_rules, "interval", minutes=1, id="dispatch_rules", max_instances=1, coalesce=True)
     scheduler.add_job(process_captures, "interval", seconds=15, id="process_captures", max_instances=1, coalesce=True)
+    scheduler.add_job(process_ig_captures, "interval", seconds=15, id="process_ig_captures", max_instances=1, coalesce=True)
     scheduler.add_job(process_reports, "interval", seconds=20, id="process_reports", max_instances=1, coalesce=True)
     scheduler.add_job(classify_pending_posts, "interval", minutes=max(1, app.config["AI_INTERVAL_MINUTES"]),
                       id="classify_pending_posts", max_instances=1, coalesce=True)

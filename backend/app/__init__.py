@@ -5,6 +5,7 @@ from .config import Config
 from .extensions import db, migrate
 from . import models  # noqa: F401
 from .api import api
+from .instagram_api import ig_api
 
 
 def create_app():
@@ -14,6 +15,7 @@ def create_app():
     migrate.init_app(app, db)
     CORS(app, resources={r"/api/*": {"origins": app.config["CORS_ORIGIN"].split(",")}})
     app.register_blueprint(api, url_prefix="/api")
+    app.register_blueprint(ig_api, url_prefix="/api/instagram")
     with app.app_context():
         db.create_all()
 

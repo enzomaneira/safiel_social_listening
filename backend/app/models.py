@@ -136,6 +136,57 @@ class AISignal(db.Model):
     risk = db.Column(db.String)  # nenhum | agressao | ameaca | acusacao_sem_prova | boato
 
 
+class IGMedia(db.Model):
+    """Post da conta do Instagram conectada (os comentários só são acessíveis em posts da própria conta)."""
+    __tablename__ = "ig_media"
+    media_id = db.Column(db.String, primary_key=True)
+    shortcode = db.Column(db.String, index=True)
+    permalink = db.Column(db.Text)
+    username = db.Column(db.String)
+    caption = db.Column(db.Text)
+    media_type = db.Column(db.String)  # IMAGE | VIDEO | CAROUSEL_ALBUM
+    media_url = db.Column(db.Text)
+    thumbnail_url = db.Column(db.Text)
+    created_at = db.Column(db.DateTime(timezone=True), index=True)
+    like_count = db.Column(db.Integer)
+    comments_count = db.Column(db.Integer)
+    first_collected_at = db.Column(db.DateTime(timezone=True), default=utcnow)
+    last_updated_at = db.Column(db.DateTime(timezone=True), default=utcnow)
+    last_captured_at = db.Column(db.DateTime(timezone=True))
+    raw_payload = db.Column(db.JSON)
+
+
+class IGComment(db.Model):
+    __tablename__ = "ig_comments"
+    comment_id = db.Column(db.String, primary_key=True)
+    media_id = db.Column(db.String, db.ForeignKey("ig_media.media_id"), index=True, nullable=False)
+    parent_id = db.Column(db.String, index=True)  # preenchido quando é resposta a outro comentário
+    author_id = db.Column(db.String)
+    username = db.Column(db.String, index=True)
+    text = db.Column(db.Text)
+    created_at = db.Column(db.DateTime(timezone=True), index=True)
+    like_count = db.Column(db.Integer)
+    hidden = db.Column(db.Boolean)
+    source_capture_id = db.Column(db.Integer, db.ForeignKey("ig_captures.id"))
+    first_collected_at = db.Column(db.DateTime(timezone=True), default=utcnow)
+    last_updated_at = db.Column(db.DateTime(timezone=True), default=utcnow)
+    raw_payload = db.Column(db.JSON)
+
+
+class IGCapture(db.Model):
+    __tablename__ = "ig_captures"
+    id = db.Column(db.Integer, primary_key=True)
+    source_url = db.Column(db.Text)
+    shortcode = db.Column(db.String)
+    media_id = db.Column(db.String)
+    status = db.Column(db.String, default="queued")  # queued | running | done | partial | error
+    comments_found = db.Column(db.Integer, default=0)
+    replies_found = db.Column(db.Integer, default=0)
+    error = db.Column(db.Text)
+    created_at = db.Column(db.DateTime(timezone=True), default=utcnow)
+    finished_at = db.Column(db.DateTime(timezone=True))
+
+
 class Report(db.Model):
     __tablename__ = "reports"
     id = db.Column(db.Integer, primary_key=True)
