@@ -3,7 +3,7 @@
 A comunicação com a Graph API fica em ``app/ig_client.py``, que deve expor:
 
     class IGClient:
-        def __init__(self, token, base, user_id): ...
+        def __init__(self, token, base, user_id, scan_limit): ...
         def find_media(self, shortcode) -> dict | None
             # mídia da conta conectada com esse shortcode (campos: id, shortcode, permalink, username,
             # caption, media_type, media_url, thumbnail_url, timestamp, like_count, comments_count)
@@ -36,7 +36,8 @@ def load_client(config):
         from .ig_client import IGClient
     except ImportError as exc:
         raise RuntimeError("Cliente da API do Instagram (backend/app/ig_client.py) não encontrado") from exc
-    return IGClient(config["INSTAGRAM_ACCESS_TOKEN"], config["INSTAGRAM_API_BASE"], config["INSTAGRAM_USER_ID"])
+    return IGClient(config["INSTAGRAM_ACCESS_TOKEN"], config["INSTAGRAM_API_BASE"], config["INSTAGRAM_USER_ID"],
+                    scan_limit=max(1, config["INSTAGRAM_MEDIA_SCAN_LIMIT"]))
 
 
 def parse_time(value):
