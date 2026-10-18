@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.blocking import BlockingScheduler
 from sqlalchemy import text
 
-from app import ai_classifier, create_app, instagram, reports
+from app import ai_classifier, create_app, create_tables, instagram, reports
 from app.extensions import db
 from app.models import AIClassification, AISignal, Capture, IGCapture, MonitoringRule, Report, SystemLog, XPost
 from app.services import month_spend, record_usage, take_snapshot, upsert_posts
@@ -390,7 +390,7 @@ def acquire_lock(timeout=None, interval=5):
 
 def main():
     with app.app_context():
-        db.create_all()
+        create_tables()
         acquire_lock()
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(dispatch_rules, "interval", minutes=1, id="dispatch_rules", max_instances=1, coalesce=True)
